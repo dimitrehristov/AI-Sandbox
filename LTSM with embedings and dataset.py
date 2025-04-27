@@ -152,7 +152,7 @@ EOS = len(english_dictionary)
 # End of Sentence token
 # We will use this token to mark the end of a sentence in our dataset
 # Now make tensors that reflect a sentence and its version shifted to the right adding 
-# end of sequence token EOS
+# end of sequences token EOS
 
 def create_input_tensor(sentence, word_dictionary): 
     word_to_index = {word: index for index, word in enumerate(word_dictionary.keys())}
