@@ -17,19 +17,17 @@
 
 from io import open
 import unicodedata
-import string
 import random
 import re
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.utils.data import Subset
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 PYTORCH_ENABLE_MPS_FALLBACK=1 # Enable MPS fallback for Apple Silicon devices
 import time, copy
 import matplotlib.pyplot as plt
 # import PIL and skimage for image processing and metrics
-from skimage.metrics import structural_similarity as ssim, peak_signal_noise_ratio as psnr
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 device = torch.device('cpu') # Force to use CPU for this assignment
@@ -47,7 +45,7 @@ if not os.path.exists("spa-eng.zip"):
 if not os.path.exists("spa.txt"):
     subprocess.run(["unzip", "spa-eng.zip"], check=True)
 # List the files in the current directory
-subprocess.run(["ls"], check=True)
+#subprocess.run(["dir"], check=True)
 
 # %%
 # Helper functions combined from PyTorch tutorial: https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html
@@ -80,6 +78,16 @@ def parse_data(filename):
 
     return pairs
 
+# Using this function we will create a dictionary to use for our one hot encoding vectors
+def add_words_to_dict(word_dictionary, word_list, sentences):
+    for sentence in sentences:
+        for word in sentence.split(" "):
+            if word in word_dictionary:
+                continue
+            else:
+                word_list.append(word)
+                word_dictionary[word] = len(word_list)-1
+
 # %%
 
 pairs = parse_data("spa.txt")
@@ -92,43 +100,42 @@ print("Number of English sentences:", len(english_sentences))
 # %%
 
 # %%
-
-# Pick up a sample soze of 6000 sentences
-sample_size = 2000
-sentences = english_sentences[:sample_size]
-print("Sample size:", len(sentences))
-print("First 5 sentences:", sentences[:5])
-# Here we are using a small number of Sentences to ease training time. Feel free to use more
-# train_size = 6000
-# train_sentences = english_sentences[:train_size]
-# val_sentences = english_sentences[train_size:train_size+1000]
-# test_sentences = english_sentences[train_size+1000:train_size+2000]
-
-# Using this function we will create a dictionary to use for our one hot encoding vectors
-def add_words_to_dict(word_dictionary, word_list, sentences):
-    for sentence in sentences:
-        for word in sentence.split(" "):
-            if word in word_dictionary:
-                continue
-            else:
-                word_list.append(word)
-                word_dictionary[word] = len(word_list)-1
-
 english_dictionary = {}
 english_list = []
-add_words_to_dict(english_dictionary, english_list, sentences)
+sentences =[]
+sample_size = 20000 # Set the sample size to a smaller number for testing purposes
 
-# add_words_to_dict(english_dictionary, english_list, train_sentences)
-# add_words_to_dict(english_dictionary, english_list, val_sentences)
-# add_words_to_dict(english_dictionary, english_list, test_sentences)
+resume = False # Set to True if you want to resume training from a saved model and dataset
+# if resume is True attemot to read the dictionary and the sentences 
 
+if resume:
+    # Load the dictionary and list from the saved file
+    if os.path.exists('english_dataset.pth'):
+        english_dictionary, english_list, sentences= torch.load('english_dataset.pth')
+        print("Loaded English dictionary and list from file.")
+        print("Sample size:", len(sentences))
+        print("First 5 sentences:", sentences[:5])
+    else:
+        print("No saved dataset found. Starting from scratch.")
+        # append the first sample_size sentences to the sentences list
+        sentences=(english_sentences[:sample_size])     
+        print("Sample size:", len(sentences))
+        print("First 5 sentences:", sentences[:5])
+        add_words_to_dict(english_dictionary, english_list, sentences)
+        resume = False # Set to False to start training from scratch
+else:
+    # append the first sample_size sentences to the sentences list
+    sentences = (english_sentences[:sample_size])     
+    print("Sample size:", len(sentences))
+    print("First 5 sentences:", sentences[:5])
+    add_words_to_dict(english_dictionary, english_list, sentences)
 
 # %% [markdown]
 # Create a dateset class that will allow us to use the dataloader to create batches of data for training and testing
 # 
 class SentenceDataset(Dataset):
-    def __init__(self, sentences, word_dictionary):
-        self.sentences = sentences
+    def __init__(self, input_sentences, word_dictionary):
+        self.sentences = input_sentences
         self.word_dictionary = word_dictionary
 
     def __len__(self):
@@ -137,8 +144,25 @@ class SentenceDataset(Dataset):
     def __getitem__(self, idx):
         sentence = self.sentences[idx]
         input_tensor = create_input_tensor(sentence, self.word_dictionary)
-        target_tensor = create_target_tensor(sentence, self.word_dictionary)
-        return input_tensor, target_tensor
+        target_tensor_local = create_target_tensor(sentence, self.word_dictionary)
+        return input_tensor, target_tensor_local
+    
+# %%
+# write code for a custom collate class to padd the variable length input_tensor and target tensor
+class Collator(object):
+    def __init__(self, pad_value=0):
+        self.pad_value = pad_value
+
+    def __call__(self, batch):
+        # Separate input and target tensors from the batch
+        input_tensors, target_tensors = zip(*batch)
+
+        # Pad the input tensors and target tensors to the same length
+        padded_inputs = pad_sequence(input_tensors, batch_first=True, padding_value=self.pad_value)
+        padded_targets = pad_sequence(target_tensors, batch_first=True, padding_value=self.pad_value)
+
+        return padded_inputs, padded_targets
+
 
 # %% [markdown]
 #  ### Encoding
@@ -148,7 +172,9 @@ class SentenceDataset(Dataset):
 
 # %%
 #  %%
-EOS = len(english_dictionary) 
+# end of sequence EOS and PAD embeddings
+EOS = len(english_dictionary)
+PAD = EOS + 1 # Padding token for variable length sequences
 # End of Sentence token
 # We will use this token to mark the end of a sentence in our dataset
 # Now make tensors that reflect a sentence and its version shifted to the right adding 
@@ -212,14 +238,15 @@ for count in range (examples_to_show):
     print("Target sentence: ", tensor_to_sentence(english_dictionary, target_tensor))   
 
 # %%
-batch_size = 1
+batch_size = 512
 # Create the dataset and dataloaders for training, validation, and testing
 train_dataset = SentenceDataset(sentences, english_dictionary)
 train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(train_dataset, [int(len(train_dataset)*0.8), int(len(train_dataset)*0.1), int(len(train_dataset)*0.1)])
 
-dataloaders = {'train': DataLoader(train_dataset, batch_size=batch_size),
-               'val': DataLoader(val_dataset, batch_size=batch_size), 
-               'test': DataLoader(test_dataset, batch_size=batch_size)}
+collate = Collator(PAD) # Initialize a Collator fo the batch processing
+dataloaders = {'train': DataLoader(train_dataset, batch_size=batch_size, collate_fn = collate),
+               'val': DataLoader(val_dataset, batch_size=batch_size, collate_fn = collate), 
+               'test': DataLoader(test_dataset, batch_size=batch_size, collate_fn = collate)}
 
 dataset_sizes = {'train': len(train_dataset),
                  'val': len(val_dataset),
@@ -239,7 +266,7 @@ def integer_to_one_hot(indices, vocab_size):
     Returns:
         torch.Tensor: One-hot encoded tensor (shape: [batch_size, seq_length, vocab_size]).
     """
-    # Create a long integet tensor of zeros with shape [batch_size, seq_length, vocab_size]
+    # Create a long integer tensor of zeros with shape [batch_size, seq_length, vocab_size]
     one_hot = torch.zeros(indices.size(0), indices.size(1), vocab_size, dtype = torch.float32).to(device)
     
     # Scatter 1s at the appropriate positions
@@ -257,12 +284,12 @@ class LSTM(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_size, output_size):
         super(LSTM, self).__init__()
         self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(vocab_size, embedding_dim) # Embedding layer to convert word indices to vectors
-        self.lstm = nn.LSTM(embedding_dim, hidden_size, num_layers=2, dropout=0.0, batch_first=True)
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=PAD) # Embedding layer to convert word indices to vectors
+        self.lstm = nn.LSTM(embedding_dim, hidden_size, num_layers=2, dropout=0.2, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(self, input, hidden):
-        embedded = self.embedding(input) # Pass the input through the embedding layer
+    def forward(self, input_sequence, hidden):
+        embedded = self.embedding(input_sequence) # Pass the input through the embedding layer
         output, hidden = self.lstm(embedded) # Pass the embedded input through the LSTM layer)
         output = self.fc(output) # Pass the output of the LSTM to the fully connected layer
         return output, hidden
@@ -273,16 +300,8 @@ class LSTM(nn.Module):
         return (torch.zeros(2, self.hidden_size).to(device), torch.zeros(2, self.hidden_size).to(device))
 
 # %%
-# %%
 
-# TODO
-# lstm = LSTM(...)
-lstm = LSTM(len(english_dictionary)+1, 64, 256, len(english_dictionary)+1) # +1 for EOS token
-lstm.to(device)
-
-# %%
-
-def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, scheduler, num_epochs=25):
+def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, scheduler, epochs=25):
     since = time.time()
 
     best_model_wts = copy.deepcopy(model.state_dict()) # keep the best weights stored separately
@@ -291,13 +310,13 @@ def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, schedule
 
     # Each epoch has a training, validation, and test phase
    # phases = ['train', 'val', 'test']
-   # phases = ['train', 'val'] # We will not use the test set for training
-    phases = ['train'] # We will only train the model on the training set
+    phases = ['train', 'val'] # We will not use the test set for training
+    # phases = ['train'] # We will only train the model on the training set
 
     # Keep track of how loss evolves during training
-    training_curves = {}
+    phase_training_curves = {}
     for phase in phases:
-        training_curves[phase+'_loss'] = []
+        phase_training_curves[phase+'_loss'] = []
 
     for epoch in range(num_epochs):
         print(f'\nEpoch {epoch+1}/{num_epochs}')
@@ -322,7 +341,11 @@ def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, schedule
 
                 # convert the intger encodingof the target sequence to a tensor
                 # with one hot encoding over the vocabulary size
-                current_target_sequence = integer_to_one_hot(target_sequence.to(device), len(english_dictionary)+1) # +1 for EOS token
+                # Create a mask for padding tokens
+                mask = (target_sequence != PAD)
+                # Convert target to one-hot encoding, applying the mask
+                current_target_sequence = integer_to_one_hot(target_sequence.to(device), len(english_dictionary)+2) * mask.unsqueeze(-1).float().to(device)
+                #current_target_sequence = integer_to_one_hot(target_sequence.to(device), len(english_dictionary)+1) # +1 for EOS token
                 # zero the parameter gradients
                 optimizer.zero_grad()
 
@@ -356,13 +379,13 @@ def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, schedule
                 scheduler.step()
 
             epoch_loss = running_loss / dataset_sizes[phase]
-            training_curves[phase+'_loss'].append(epoch_loss)
+            phase_training_curves[phase+'_loss'].append(epoch_loss)
 
             print(f'{phase:5} Loss: {epoch_loss:.4f}')
 
             # deep copy the model if it's the best loss
             # Note: We are using the train loss here to determine our best model
-            if phase == 'train' and epoch_loss < best_loss:
+            if phase == 'val' and epoch_loss < best_loss:
               best_epoch = epoch
               best_loss = epoch_loss
               best_model_wts = copy.deepcopy(model.state_dict())
@@ -374,7 +397,7 @@ def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, schedule
     # load best model weights
     model.load_state_dict(best_model_wts)
 
-    return model, training_curves
+    return model, phase_training_curves
 
 
 # %%
@@ -382,11 +405,11 @@ def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, schedule
 # We define our predict function here so that we can run some predictions in the same cell as our training!
 def predict(model, word_dictionary, word_list, input_sentence, max_length = 20):
     output_sentence = input_sentence + " "
-    tensor = create_input_tensor(input_sentence, word_dictionary)
+    input_tensor = create_input_tensor(input_sentence, word_dictionary)
     hidden = model.initHidden()
     # First unsqueze the tensor to make it a batch of size 1
-    tensor = tensor.unsqueeze(0)  # Add batch dimension
-    current_input_sequence = tensor.to(device)
+    input_tensor = input_tensor.unsqueeze(0)  # Add batch dimension
+    current_input_sequence = input_tensor.to(device)
     input = None
 
     for i in range(current_input_sequence.size(1)):
@@ -423,17 +446,70 @@ def predict(model, word_dictionary, word_list, input_sentence, max_length = 20):
 # %%
 
 # TODO: Fill in the necessary code to execute the training function
-learning_rate = 0.01
-num_epochs = 50
-criterion = nn.CrossEntropyLoss() # CrossEntropyLoss for classification!
-optimizer = torch.optim.Adam(lstm.parameters(), lr=learning_rate,weight_decay=0.001) # Use Adam for optimization
-# Note: You can use other optimizers as well, but Adam is a good default choice for this task
-# Note: You can also experiment with other learning rates and optimizers if you would like
+learning_rate = 0.05
+num_epochs = 200
+
+# Define the model, loss function (criterion), optimizer, and learning rate scheduler
+
+# model: lstm = LSTM(...)
+lstm = LSTM(len(english_dictionary)+2, 128, 256, len(english_dictionary)+2) # +2 for EOS and PAD tokens
+lstm.to(device)
+# Print the model architecture
+print(lstm)
+# Print the number of parameters in the model
+num_params = sum(p.numel() for p in lstm.parameters() if p.requires_grad)
+print(f'Number of parameters in the model: {num_params}')
+
+# Optimizer 
+optimizer = torch.optim.Adam(lstm.parameters(), lr=learning_rate, weight_decay=0.001)
+
+# Criterion (loss)
+criterion = nn.CrossEntropyLoss(reduction="sum") # CrossEntropyLoss for classification!    
+
+if resume:
+    # Check if the model and optimizer state dictionaries exist
+    if not os.path.exists('lstm_sentence_completion.pth') or not os.path.exists('lstm_optimizer.pth'):
+        print("No saved model or optimizer state found. Starting from scratch.")
+        resume = False
+    else:
+        print("Resuming training from saved model and optimizer state.")
+    # Load the model and optimizer state dictionaries
+        lstm.load_state_dict(torch.load('lstm_sentence_completion.pth'))
+        optimizer.load_state_dict(torch.load('lstm_optimizer.pth'))
+
+# Learning rate scheduler
+# Using ExponentialLR to reduce the learning rate by a factor of 0.95 every epoch
 scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
-
+# Start training the model
 lstm, training_curves = train_lstm(lstm, dataloaders, dataset_sizes,
-                                     criterion, optimizer, scheduler, num_epochs=num_epochs)
+                                     criterion, optimizer, scheduler, epochs=num_epochs)
+
+# Save the model
+torch.save(lstm.state_dict(), 'lstm_sentence_completion.pth')
+# Save the current state of the optimizer to resume training later if needed
+torch.save(optimizer.state_dict(), 'lstm_optimizer.pth')
+
+# Save the dataset and dictionary for later use
+torch.save((english_dictionary, english_list, sentences), 'english_dataset.pth')
+
+last_run_curves={}
+if resume:
+    if os.path.exists('training_curves.pth'):
+            last_run_curves = torch.load('training_curves.pth')
+# Combine the last run training curves with the new one
+# if the last_run_curves are not empty
+if last_run_curves:
+    for key in last_run_curves.keys():
+        if key in training_curves:
+            last_run_curves[key].extend(training_curves[key])
+else:
+    last_run_curves = training_curves;
+
+# Save the training curves for plotting later
+torch.save(last_run_curves, 'training_curves.pth')
+
+
 
 print(predict(lstm, english_dictionary, english_list, "what is"))
 print(predict(lstm, english_dictionary, english_list, "my name"))
@@ -444,17 +520,39 @@ print(predict(lstm, english_dictionary, english_list, "choose"))
 # %%
 # %%
 
-def plot_training_curves(training_curves,
-                         phases=['train', 'val', 'test'],
-                         metrics=['loss']):
-    epochs = list(range(len(training_curves['train_loss'])))
+def plot_training_curves(curves, phases=None, metrics=None):
+    """
+    Plots training curves for specified metrics and phases.
+
+    Args:
+        curves (dict): A dictionary containing training data. Keys should be in 
+            the format '<phase>_<metric>' (e.g., 'train_loss', 'val_accuracy').
+        phases (list, optional): A list of phases to plot (e.g., ['train', 'val', 'test']).
+            Defaults to ['train', 'val', 'test'] if not provided.
+        metrics (list, optional): A list of metrics to plot (e.g., ['loss', 'accuracy']).
+            Defaults to ['loss'] if not provided.
+
+    Behavior:
+        - For each metric in the `metrics` list, a separate plot is created.
+        - For each phase in the `phases` list, the corresponding curve is plotted
+          if the key '<phase>_<metric>' exists in the `curves` dictionary.
+        - The x-axis represents the epochs, and the y-axis represents the metric values.
+
+    Returns:
+        None: The function displays the plots but does not return any value.
+    """
+    if phases is None:
+        phases = ['train', 'val', 'test']
+    if metrics is None:
+        metrics = ['loss']
+    epochs = list(range(len(curves['train_loss'])))
     for metric in metrics:
         plt.figure()
         plt.title(f'Training curves - {metric}')
         for phase in phases:
             key = phase+'_'+metric
-            if key in training_curves:
-                plt.plot(epochs, training_curves[key])
+            if key in curves:
+                plt.plot(epochs, curves[key])
         plt.xlabel('epoch')
         plt.legend(labels=phases)
         plt.show()
@@ -462,7 +560,6 @@ def plot_training_curves(training_curves,
 
 
 # %%
-# %
-plot_training_curves(training_curves, phases=['train'])
+# 
 
-
+plot_training_curves(last_run_curves, phases=['train', 'val'])
