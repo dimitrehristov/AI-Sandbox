@@ -105,7 +105,7 @@ english_list = []
 sentences =[]
 sample_size = 20000 # Set the sample size to a smaller number for testing purposes
 
-resume = False # Set to True if you want to resume training from a saved model and dataset
+resume = True # Set to True if you want to resume training from a saved model and dataset
 # if resume is True attemot to read the dictionary and the sentences 
 
 if resume:
@@ -131,8 +131,8 @@ else:
     add_words_to_dict(english_dictionary, english_list, sentences)
 
 # %% [markdown]
-# Create a dateset class that will allow us to use the dataloader to create batches of data for training and testing
-# 
+# Create a dataset class that will allow us to use the dataloader to create batches of data for training and testing
+# Return input_tensor, target_tensor (_locap)
 class SentenceDataset(Dataset):
     def __init__(self, input_sentences, word_dictionary):
         self.sentences = input_sentences
@@ -238,7 +238,7 @@ for count in range (examples_to_show):
     print("Target sentence: ", tensor_to_sentence(english_dictionary, target_tensor))   
 
 # %%
-batch_size = 512
+batch_size = 1024
 # Create the dataset and dataloaders for training, validation, and testing
 train_dataset = SentenceDataset(sentences, english_dictionary)
 train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(train_dataset, [int(len(train_dataset)*0.8), int(len(train_dataset)*0.1), int(len(train_dataset)*0.1)])
@@ -339,7 +339,7 @@ def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, schedule
                 current_input_sequence = input_sequence.to(device)
 
 
-                # convert the intger encodingof the target sequence to a tensor
+                # convert the integer encoding of the target sequence to a tensor
                 # with one hot encoding over the vocabulary size
                 # Create a mask for padding tokens
                 mask = (target_sequence != PAD)
@@ -373,7 +373,7 @@ def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, schedule
                         optimizer.step()
 
                 # statistics
-                running_loss += loss.item() / current_input_sequence.size(0)
+                running_loss += loss.item()
 
             if phase == 'train':
                 scheduler.step()
@@ -381,7 +381,7 @@ def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, schedule
             epoch_loss = running_loss / dataset_sizes[phase]
             phase_training_curves[phase+'_loss'].append(epoch_loss)
 
-            print(f'{phase:5} Loss: {epoch_loss:.4f}')
+            print(f'{phase:5} Loss: {epoch_loss:.8f}')
 
             # deep copy the model if it's the best loss
             # Note: We are using the train loss here to determine our best model
@@ -447,7 +447,7 @@ def predict(model, word_dictionary, word_list, input_sentence, max_length = 20):
 
 # TODO: Fill in the necessary code to execute the training function
 learning_rate = 0.05
-num_epochs = 200
+num_epochs = 20
 
 # Define the model, loss function (criterion), optimizer, and learning rate scheduler
 
